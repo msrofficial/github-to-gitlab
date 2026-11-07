@@ -41,6 +41,8 @@ const CONFIG = {
   includeForks: bool(process.env.INCLUDE_FORKS, false),
   includeArchived: bool(process.env.INCLUDE_ARCHIVED, true),
   onlyMatch: process.env.ONLY_MATCH || '',
+  // mirror = follow the GitHub repo (public -> public, private -> private)
+  visibility: (process.env.GL_VISIBILITY || 'mirror').trim().toLowerCase(),
   unprotect: bool(process.env.GL_UNPROTECT, true),
   dryRun: bool(process.env.DRY_RUN, false),
   // Replaces repository names in all output with short hashes. Use it when the
@@ -300,11 +302,36 @@ function markerOf(project) {
   return match ? match[1].toLowerCase() : null;
 }
 
+function desiredVisibility(repo) {
+  if (CONFIG.visibility === 'mirror') return repo.visibility === 'public' ? 'public' : 'private';
+  return CONFIG.visibility;
+}
+
+// Keeps an already-mirrored project in step with the source repo's visibility.
+async function applyVisibility(project, repo) {
+  const want = desiredVisibility(repo);
+  if (CONFIG.dryRun || project.visibility === want) return project;
+  try {
+    const updated = await glApi('PUT', `/projects/${project.id}`, { visibility: want });
+    console.log(
+      `  [vis ] ${projectLabel(project.path_with_namespace)} -> ${want}`
+    );
+    return updated;
+  } catch (error) {
+    console.log(
+      `  [warn] ${projectLabel(project.path_with_namespace)}: visibility unchanged (${scrub(error.message, repo, project)})`
+    );
+    return project;
+  }
+}
+
 async function ensureProject(repo, ns, projects) {
   const wanted = repo.full_name.toLowerCase();
 
   for (const project of projects.values()) {
-    if (markerOf(project) === wanted) return { project, created: false };
+    if (markerOf(project) === wanted) {
+      return { project: await applyVisibility(project, repo), created: false };
+    }
   }
 
   let targetPath = slug(repo.name);
@@ -320,7 +347,7 @@ async function ensureProject(repo, ns, projects) {
         if (markerOf(existing) !== wanted) {
           throw new Error(`GitLab path "${targetPath}" is already taken by another project`);
         }
-        return { project: existing, created: false };
+        return { project: await applyVisibility(existing, repo), created: false };
       }
     } else if (!owner && !existing.empty_repo) {
       throw new Error(
@@ -332,7 +359,7 @@ async function ensureProject(repo, ns, projects) {
   const body = {
     name: repo.name,
     path: targetPath,
-    visibility: 'private',
+    visibility: desiredVisibility(repo),
     description: `${MARKER}${repo.full_name}`,
     initialize_with_readme: false,
   };
@@ -342,7 +369,10 @@ async function ensureProject(repo, ns, projects) {
 
   let project;
   if (existing) {
-    project = await glApi('PUT', `/projects/${existing.id}`, { description: body.description });
+    project = await glApi('PUT', `/projects/${existing.id}`, {
+      description: body.description,
+      visibility: body.visibility,
+    });
   } else {
     project = await glApi('POST', '/projects', body);
   }
@@ -419,6 +449,9 @@ function assertConfig() {
       die(`ONLY_MATCH is not a valid regular expression: ${CONFIG.onlyMatch}`);
     }
   }
+  if (!['mirror', 'private', 'public', 'internal'].includes(CONFIG.visibility)) {
+    die(`GL_VISIBILITY must be mirror, private, public or internal (got "${CONFIG.visibility}").`);
+  }
 }
 
 async function main() {
@@ -430,6 +463,9 @@ async function main() {
   console.log(`  GitLab    : ${CONFIG.glHost}`);
   console.log(`  Namespace : ${CONFIG.namespace || '(personal namespace of the token owner)'}`);
   console.log(`  Cache dir : ${CONFIG.mirrorDir}`);
+  console.log(
+    `  Visibility: ${CONFIG.visibility === 'mirror' ? 'same as GitHub' : CONFIG.visibility}`
+  );
   if (CONFIG.dryRun) console.log('  Mode      : DRY RUN (no changes are made)');
 
   const me = await glApi('GET', '/user');

@@ -98,6 +98,7 @@ It then runs every 30 minutes on its own, or trigger it by hand from
 | `INCLUDE_FORKS` | `false` | Also mirror forks |
 | `INCLUDE_ARCHIVED` | `true` | Also mirror archived repos |
 | `ONLY_MATCH` | — | Regex on `owner/repo`, useful for a first run |
+| `GL_VISIBILITY` | `mirror` | `mirror` = same as GitHub (public → public, private → private); or force `private` / `public` |
 | `GL_UNPROTECT` | `true` | Drop GitLab branch protection so force-pushes can land |
 | `DRY_RUN` | `false` | Print the plan, change nothing |
 | `HIDE_NAMES` | `false` | Replace repo names in output with short hashes |
@@ -106,11 +107,15 @@ It then runs every 30 minutes on its own, or trigger it by hand from
 
 | On GitHub | On GitLab |
 |---|---|
-| new repo | new private project (name clash → `repo-owner` suffix) |
+| new repo | new project with the **same visibility** as on GitHub (name clash → `repo-owner` suffix) |
 | new commit / branch / tag | synced with `git push --mirror` |
 | branch/tag deleted | deleted on GitLab too |
 | history rewrite (force-push) | force-pushed; branch protection is removed when needed (`GL_UNPROTECT`) |
 | repo renamed | the old project stays, a new one is created under the new name |
+
+Visibility follows the source repository: a public GitHub repo becomes a public GitLab project, a private one stays
+private (`internal` counts as private). If an existing project's visibility differs, the run corrects it. To keep every
+backup private regardless of the source, set `GL_VISIBILITY=private`.
 
 Every GitLab project carries a `github-mirror:owner/repo` marker in its description — that is how repos are matched.
 Two repos with the same name (for example `you/api` and `myorg/api`) are therefore backed up separately.
