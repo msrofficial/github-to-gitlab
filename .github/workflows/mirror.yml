@@ -1,0 +1,47 @@
+name: Mirror GitHub to GitLab
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # Checkout would otherwise leave a second Authorization header for
+          # github.com in .git/config, which conflicts with the PAT header the
+          # script sets for its own clones.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Keeps bare clones between runs so each run only transfers new objects.
+      # A cold run (cache miss) re-clones every repository from scratch.
+      - uses: actions/cache@v4
+        with:
+          path: .mirrors
+          key: mirrors-${{ github.run_id }}
+          restore-keys: mirrors-
+
+      - run: node mirror.mjs
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GL_TOKEN: ${{ secrets.GL_TOKEN }}
+          GL_NAMESPACE: ${{ vars.GL_NAMESPACE }}
+          # Public repo: keep repository names out of the readable action logs.
+          # Set this to "0" temporarily when you need to debug a failing repo.
+          HIDE_NAMES: "1"

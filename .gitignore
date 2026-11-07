@@ -1,0 +1,5 @@
+.env
+.mirrors/
+mirror.log
+node_modules/
+.freebuff/
