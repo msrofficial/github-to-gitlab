@@ -288,33 +288,13 @@ async function resolveNamespace(me) {
   die(`GitLab namespace "${wanted}" was not found or is not visible to this token.`);
 }
 
-async function listNamespaceProjects(ns, me) {
-  const projects = new Map();
-  const wantedNs = ns.full_path.toLowerCase();
-
-  for (let page = 1; page <= 100; page++) {
-    if (ns.id) {
-      const batch = await glApi(
-        'GET',
-        `/projects?namespace_id=${ns.id}&per_page=100&page=${page}&order_by=path`
-      );
-      for (const project of batch) projects.set(project.path.toLowerCase(), project);
-      if (batch.length < 100) break;
-      continue;
-    }
-
-    // `/users/:id/projects` is the public profile listing and hides private
-    // projects, which made every private mirror look missing. Page through the
-    // authenticated user's own projects instead, then keep the namespace.
-    const batch = await glApi('GET', `/projects?owned=true&per_page=100&page=${page}`);
-    for (const project of batch) {
-      const projectNs = String((project.namespace && project.namespace.full_path) || '').toLowerCase();
-      if (projectNs === wantedNs) projects.set(project.path.toLowerCase(), project);
-    }
-    if (batch.length < 100) break;
-  }
-
-  return projects;
+// Direct lookup instead of crawling the whole namespace: accounts with
+// thousands of projects made a full listing take minutes per run, and the
+// per-user projects endpoint never showed private ones at all.
+async function findProject(ns, projectPath) {
+  return glApi('GET', `/projects/${encodeURIComponent(`${ns.full_path}/${projectPath}`)}`, null, {
+    allow404: true,
+  });
 }
 
 function markerOf(project) {
@@ -345,75 +325,65 @@ async function applyVisibility(project, repo) {
   }
 }
 
-async function ensureProject(repo, ns, projects) {
+async function ensureProject(repo, ns) {
   const wanted = repo.full_name.toLowerCase();
+  const base = slug(repo.name);
+  const candidates = [base, `${base}-${slug(repo.owner.login)}`];
 
-  for (const project of projects.values()) {
-    if (markerOf(project) === wanted) {
-      return { project: await applyVisibility(project, repo), created: false };
-    }
-  }
+  for (const candidate of candidates) {
+    const existing = await findProject(ns, candidate);
+    if (!existing) continue;
 
-  let targetPath = slug(repo.name);
-  let existing = projects.get(targetPath.toLowerCase());
-
-  if (existing) {
     const owner = markerOf(existing);
-    if (owner && owner !== wanted) {
-      // Another GitHub repo already owns this path: disambiguate by owner.
-      targetPath = `${slug(repo.name)}-${slug(repo.owner.login)}`;
-      existing = projects.get(targetPath.toLowerCase());
-      if (existing) {
-        if (markerOf(existing) !== wanted) {
-          throw new Error(`GitLab path "${targetPath}" is already taken by another project`);
-        }
-        return { project: await applyVisibility(existing, repo), created: false };
-      }
-    } else if (!owner && !existing.empty_repo) {
+    if (owner === wanted) {
+      return { project: await applyVisibility(existing, repo), created: false };
+    }
+    if (owner) continue; // another GitHub repo already owns this path
+    if (!existing.empty_repo) {
       throw new Error(
         `GitLab project "${existing.path_with_namespace}" already exists and is not empty; refusing to overwrite it`
       );
     }
+
+    // An empty project without a marker: adopt it.
+    const adopted = await glApi('PUT', `/projects/${existing.id}`, {
+      description: `${MARKER}${repo.full_name}`,
+      visibility: desiredVisibility(repo),
+    });
+    if (CONFIG.unprotect) await removeBranchProtection(adopted);
+    return { project: adopted, created: true };
   }
 
   const body = {
     name: repo.name,
-    path: targetPath,
+    path: base,
     visibility: desiredVisibility(repo),
     description: `${MARKER}${repo.full_name}`,
     initialize_with_readme: false,
   };
   if (ns.id) body.namespace_id = ns.id;
 
-  if (CONFIG.dryRun) return { project: null, created: true, plannedPath: targetPath };
+  if (CONFIG.dryRun) return { project: null, created: true, plannedPath: base };
 
   let project;
-  if (existing) {
-    project = await glApi('PUT', `/projects/${existing.id}`, {
-      description: body.description,
-      visibility: body.visibility,
-    });
-  } else {
-    try {
-      project = await glApi('POST', '/projects', body);
-    } catch (error) {
-      // Safety net: if the path is taken but the project was invisible in the
-      // listing, adopt it when it carries our marker for this repo.
-      if (!/has already been taken|already exists/i.test(error.message)) throw error;
-      const adopted = await glApi(
-        'GET',
-        `/projects/${encodeURIComponent(`${ns.full_path}/${targetPath}`)}`,
-        null,
-        { allow404: true }
-      );
-      if (!adopted || markerOf(adopted) !== wanted) throw error;
-      project = adopted;
+  try {
+    project = await glApi('POST', '/projects', body);
+  } catch (error) {
+    // The path may be taken by a project the lookup could not see; adopt it
+    // only when it carries our marker for this very repo.
+    if (!/has already been taken|already exists/i.test(error.message)) throw error;
+    for (const candidate of candidates) {
+      const adopted = await findProject(ns, candidate);
+      if (adopted && markerOf(adopted) === wanted) {
+        project = adopted;
+        break;
+      }
     }
+    if (!project) throw error;
   }
-  projects.set(project.path.toLowerCase(), project);
 
   if (CONFIG.unprotect) await removeBranchProtection(project);
-  return { project, created: !existing };
+  return { project, created: true };
 }
 
 async function removeBranchProtection(project) {
@@ -512,13 +482,10 @@ async function main() {
   console.log(`${repos.length} GitHub repositor${repos.length === 1 ? 'y' : 'ies'} to mirror\n`);
   if (repos.length === 0) return;
 
-  const projects = await listNamespaceProjects(ns, me);
-  console.log(`  Found     : ${projects.size} existing project(s) in the namespace\n`);
-
   const plan = [];
   for (const repo of repos) {
     try {
-      const { project, created, plannedPath } = await ensureProject(repo, ns, projects);
+      const { project, created, plannedPath } = await ensureProject(repo, ns);
       if (!project && plannedPath) {
         console.log(
           `  [plan] ${label(repo)} -> ${projectLabel(`${ns.full_path}/${plannedPath}`)} (new)`
