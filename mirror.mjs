@@ -479,7 +479,13 @@ async function main() {
   );
 
   const repos = await listGithubRepos();
-  console.log(`${repos.length} GitHub repositor${repos.length === 1 ? 'y' : 'ies'} to mirror\n`);
+  const publicRepos = repos.filter((repo) => desiredVisibility(repo) === 'public').length;
+  console.log(
+    `${repos.length} GitHub repositor${repos.length === 1 ? 'y' : 'ies'} to mirror (` +
+      (CONFIG.visibility === 'mirror'
+        ? `${publicRepos} public, ${repos.length - publicRepos} private on GitLab)\n`
+        : `all ${CONFIG.visibility} on GitLab)\n`)
+  );
   if (repos.length === 0) return;
 
   const plan = [];
