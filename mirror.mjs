@@ -38,6 +38,9 @@ const CONFIG = {
   namespace: (process.env.GL_NAMESPACE || '').trim(),
   mirrorDir: path.resolve(process.env.MIRROR_DIR || '.mirrors'),
   concurrency: Math.max(1, Math.min(8, Number(process.env.CONCURRENCY) || 3)),
+  // Without a timeout a stalled API connection keeps a run alive for hours
+  // (the runner only stops it at the job timeout).
+  requestTimeoutMs: Math.max(5000, Number(process.env.REQUEST_TIMEOUT_MS) || 60000),
   includeForks: bool(process.env.INCLUDE_FORKS, false),
   includeArchived: bool(process.env.INCLUDE_ARCHIVED, true),
   onlyMatch: process.env.ONLY_MATCH || '',
@@ -148,7 +151,7 @@ async function request(url, init, label) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let res;
     try {
-      res = await fetch(url, init);
+      res = await fetch(url, { ...init, signal: AbortSignal.timeout(CONFIG.requestTimeoutMs) });
     } catch (error) {
       lastError = error;
       if (attempt === 2) break;
@@ -287,13 +290,30 @@ async function resolveNamespace(me) {
 
 async function listNamespaceProjects(ns, me) {
   const projects = new Map();
+  const wantedNs = ns.full_path.toLowerCase();
+
   for (let page = 1; page <= 100; page++) {
-    const batch = ns.id
-      ? await glApi('GET', `/projects?namespace_id=${ns.id}&per_page=100&page=${page}&order_by=path`)
-      : await glApi('GET', `/users/${me.id}/projects?per_page=100&page=${page}&order_by=path`);
-    for (const project of batch) projects.set(project.path.toLowerCase(), project);
+    if (ns.id) {
+      const batch = await glApi(
+        'GET',
+        `/projects?namespace_id=${ns.id}&per_page=100&page=${page}&order_by=path`
+      );
+      for (const project of batch) projects.set(project.path.toLowerCase(), project);
+      if (batch.length < 100) break;
+      continue;
+    }
+
+    // `/users/:id/projects` is the public profile listing and hides private
+    // projects, which made every private mirror look missing. Page through the
+    // authenticated user's own projects instead, then keep the namespace.
+    const batch = await glApi('GET', `/projects?owned=true&per_page=100&page=${page}`);
+    for (const project of batch) {
+      const projectNs = String((project.namespace && project.namespace.full_path) || '').toLowerCase();
+      if (projectNs === wantedNs) projects.set(project.path.toLowerCase(), project);
+    }
     if (batch.length < 100) break;
   }
+
   return projects;
 }
 
@@ -374,7 +394,21 @@ async function ensureProject(repo, ns, projects) {
       visibility: body.visibility,
     });
   } else {
-    project = await glApi('POST', '/projects', body);
+    try {
+      project = await glApi('POST', '/projects', body);
+    } catch (error) {
+      // Safety net: if the path is taken but the project was invisible in the
+      // listing, adopt it when it carries our marker for this repo.
+      if (!/has already been taken|already exists/i.test(error.message)) throw error;
+      const adopted = await glApi(
+        'GET',
+        `/projects/${encodeURIComponent(`${ns.full_path}/${targetPath}`)}`,
+        null,
+        { allow404: true }
+      );
+      if (!adopted || markerOf(adopted) !== wanted) throw error;
+      project = adopted;
+    }
   }
   projects.set(project.path.toLowerCase(), project);
 
@@ -479,6 +513,7 @@ async function main() {
   if (repos.length === 0) return;
 
   const projects = await listNamespaceProjects(ns, me);
+  console.log(`  Found     : ${projects.size} existing project(s) in the namespace\n`);
 
   const plan = [];
   for (const repo of repos) {
